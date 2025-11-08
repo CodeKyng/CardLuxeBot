@@ -104,7 +104,7 @@ bot.hears(/^(Sell Crypto|Sell Giftcard)$/i, async (ctx) => {
   ctx.session.flow = {};
   ctx.session.flow.step = 'choose_type';
   ctx.session.flow.type = ctx.message.text.toLowerCase().includes('crypto') ? 'crypto' : 'giftcard';
-  await ctx.reply(`You chose to sell: ${ctx.session.flow.type}\nPlease enter the amount (e.g., 0.005 or 50):`);
+  await ctx.reply(`You chose to sell: ${ctx.session.flow.type}\nPlease enter the amount (e.g., $10 or $50):`);
 });
 
 // Capture amount -> currency/card -> ask for proof images
