@@ -224,11 +224,15 @@ bot.action(/^(approve|reject):(\d+)$/, async (ctx) => {
   }
 
   if (action === 'reject') {
-    updateTxStatusStmt.run({ id: txId, status: 'rejected', admin_note: `Rejected by admin ${ctx.from.id} at ${nowISO()}` });
-    await ctx.editMessageText(`Transaction ${txId} has been REJECTED by admin.`);
-    // notify user
-    await ctx.telegram.sendMessage(txRow.user_id, `Your transaction (ID: ${txId}) was rejected by the admin. You may contact support for details.`);
-    return ctx.answerCbQuery('Rejected.');
+    // Start rejection flow
+    ctx.session = ctx.session || {};
+    ctx.session.rejectionFlow = {
+      txId: txId,
+      step: 'await_reason',
+      userId: txRow.user_id
+    };
+    await ctx.editMessageText(`Transaction ${txId}: Please provide the reason for rejection. You can also send an image if needed.`);
+    return ctx.answerCbQuery('Please provide rejection reason.');
   }
 
   // Approve
@@ -239,7 +243,14 @@ bot.action(/^(approve|reject):(\d+)$/, async (ctx) => {
   const user = getUserStmt.get(txRow.user_id);
   let saved = null;
   if (user && user.account_details) {
-    try { saved = JSON.parse(user.account_details); } catch (e) {}
+    try { 
+      saved = JSON.parse(user.account_details);
+      // Check if bank account details are present
+      const hasRequiredDetails = saved.account_number && saved.bank_name;
+      if (!hasRequiredDetails) {
+        saved = null; // Force new details prompt if missing required fields
+      }
+    } catch (e) {}
   }
 
   if (saved && Object.keys(saved).length > 0) {
@@ -247,9 +258,9 @@ bot.action(/^(approve|reject):(\d+)$/, async (ctx) => {
     await ctx.telegram.sendMessage(txRow.user_id,
       `Your transaction (ID: ${txId}) was approved.\nWe have saved account details:\n${Object.entries(saved).map(([k,v])=>`${k}: ${v}`).join('\n')}\n\nReply "CONFIRM" to use these details, or send new account details in the format:\nfield1:value1\nfield2:value2`);
   } else {
-    // no saved details - prompt
+    // no saved details or missing bank details - prompt
     await ctx.telegram.sendMessage(txRow.user_id,
-      `Your transaction (ID: ${txId}) was approved.\nPlease send your account details now in the format (each on new line):\naccount_name:John Doe\naccount_number:0123456789\nbank:ABC Bank\n\nOr send any payment receiving details your prefer.`);
+      `Your transaction (ID: ${txId}) was approved.\nPlease send your bank account details in the following format (each on new line):\naccount_name:Full Name\naccount_number:Your Account Number\nbank_name:Your Bank Name\nswift_code:Bank SWIFT Code (optional)\nbank_branch:Branch Name (optional)\n\nAll fields are required unless marked optional.`);
   }
 
   // Also send the admin the user's current stored details (if any) and file_ids for record
@@ -259,6 +270,57 @@ bot.action(/^(approve|reject):(\d+)$/, async (ctx) => {
   await ctx.telegram.sendMessage(ADMIN_CHAT_ID, adminMsg);
 
   return ctx.answerCbQuery('Approved.');
+});
+
+// Handle admin rejection reason
+bot.on(['text', 'photo'], async (ctx, next) => {
+  if (ctx.from.id === ADMIN_CHAT_ID && ctx.session?.rejectionFlow?.step === 'await_reason') {
+    const { txId, userId } = ctx.session.rejectionFlow;
+    let rejectionReason = '';
+    let imageFileId = null;
+
+    if (ctx.message.text) {
+      rejectionReason = ctx.message.text.trim();
+    }
+    
+    if (ctx.message.photo) {
+      const photos = ctx.message.photo;
+      imageFileId = photos[photos.length - 1].file_id; // get largest photo
+      if (ctx.message.caption) {
+        rejectionReason = ctx.message.caption.trim();
+      }
+    }
+
+    if (!rejectionReason && !imageFileId) {
+      return ctx.reply('Please provide a reason for rejection or send an image with caption.');
+    }
+
+    // Update transaction with rejection reason
+    updateTxStatusStmt.run({ 
+      id: txId, 
+      status: 'rejected', 
+      admin_note: JSON.stringify({
+        reason: rejectionReason,
+        imageFileId: imageFileId,
+        rejectedAt: nowISO(),
+        rejectedBy: ctx.from.id
+      })
+    });
+
+    // Notify user with reason and image if provided
+    const userMsg = `Your transaction (ID: ${txId}) was rejected.\nReason: ${rejectionReason}`;
+    if (imageFileId) {
+      await ctx.telegram.sendPhoto(userId, imageFileId, { caption: userMsg });
+    } else {
+      await ctx.telegram.sendMessage(userId, userMsg);
+    }
+
+    await ctx.reply(`Transaction ${txId} has been rejected and user has been notified.`);
+    ctx.session.rejectionFlow = null;
+    return;
+  }
+  
+  return next();
 });
 
 // Handle replies (user sending account details after approval)
@@ -300,6 +362,14 @@ bot.on('text', async (ctx, next) => {
       }
       if (Object.keys(obj).length === 0) {
         return ctx.reply('Could not parse account details. Use format key:value each on its own line.');
+      }
+      
+      // Check for required bank account fields
+      const requiredFields = ['account_name', 'account_number', 'bank_name'];
+      const missingFields = requiredFields.filter(field => !obj[field]);
+      
+      if (missingFields.length > 0) {
+        return ctx.reply(`Missing required fields: ${missingFields.join(', ')}.\nPlease provide all required bank account details.`);
       }
       // update DB (in prod, encrypt)
       upsertAccountStmt.run({ id: ctx.from.id, account_details: JSON.stringify(obj) });
